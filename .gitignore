@@ -1,0 +1,11 @@
+data/
+fingerprint_runs/
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+*.log
+.DS_Store
+Thumbs.db
+work/
