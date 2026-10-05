@@ -5,7 +5,6 @@ import collections
 import csv
 import datetime as dt
 import getpass
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,18 +17,40 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = '2.0.0'
+import fingerprint as fp
+
+VERSION = '2.1.0'
 SCHEMA = {'type': 'json_schema', 'json_schema': {'name': 'probe', 'strict': True,
     'schema': {'type': 'object', 'properties': {'x': {'type': 'integer'}},
                'required': ['x'], 'additionalProperties': False}}}
 
+# Tokenizer probes share one wrapper. Comparing each probe against the empty
+# tokenizer_base cancels the chat template and any hidden system prompt a relay
+# injects, leaving only how the payload itself was sliced. tokenizer_0/1 keep
+# their 2.0 text so older runs still line up with references.
+TOKENIZER_WRAPPER = 'Reply with exactly OK. Data:\n'
+TOKENIZER_PAYLOADS = {
+    'tokenizer_base': '',
+    'tokenizer_0': 'Hello, 世界! 👨‍💻🚀\nantidisestablishmentarianism\n道德道德道德',
+    'tokenizer_1': 'a'*64 + '\n1234567890'*8 + '\n你好世界'*16,
+    # Digit grouping separates 3-digit BPE vocabularies from per-digit ones.
+    'tokenizer_2': '1234567890 '*32 + '\n' + '```python\nx = 1\n```',
+    'tokenizer_3': '🎉'*48 + '\n' + '안녕하세요'*12 + '\n' + 'ЁЖЗИЙ'*16,
+    # Natural Chinese prose: vocabularies trained on Chinese compress it most.
+    'tokenizer_4': ('清晨的薄雾笼罩着古老的石桥，河面上偶尔传来渔夫低沉的号子。'
+                    '镇上的茶馆刚刚开门，掌柜一边擦拭着桌椅，一边和熟客闲谈今年的收成与天气。'
+                    '远处的山峦在阳光下渐渐显出轮廓，仿佛一幅尚未完成的水墨画。'),
+    # Indentation runs and a tab: whitespace merging differs between vocabularies.
+    'tokenizer_5': ('def merge(a, b):\n    out = []\n    while a and b:\n        if a[0] <= b[0]:\n'
+                    '            out.append(a.pop(0))\n        else:\n            out.append(b.pop(0))\n'
+                    '\treturn out + a + b\n'),
+}
 
-def dumps(x):
-    return json.dumps(x, ensure_ascii=False, sort_keys=True)
-
-
-def digest(x):
-    return hashlib.sha256(x.encode('utf-8')).hexdigest()
+# Re-exported so existing callers of core.dumps/core.digest keep working.
+dumps = fp.dumps
+digest = fp.digest
+redact = fp.redact
+md = fp.md
 
 
 def validate_key(key, model):
@@ -63,9 +84,8 @@ def suite(long_lines):
     add('chinese', 'chinese', '把“尽管下雨，他还是按时到了。”改写成使用“虽然……但是……”的一句话。只输出改写后的句子。')
     add('chinese_order', 'chinese', '将以下词语按给定顺序倒序输出，用中文逗号分隔，不加标点或解释：山，水，云，月', expected='月，云，水，山')
     add('english', 'writing', 'Describe a silent train station in exactly two sentences, without using the words quiet, empty, or lonely.')
-    for i, text in enumerate(['Hello, 世界! 👨‍💻🚀\nantidisestablishmentarianism\n道德道德道德',
-                              'a'*64 + '\n1234567890'*8 + '\n你好世界'*16]):
-        add('tokenizer_'+str(i), 'usage', 'Reply with exactly OK. Data:\n'+text, expected='OK')
+    for name, text in TOKENIZER_PAYLOADS.items():
+        add(name, 'usage', TOKENIZER_WRAPPER+text, expected='OK')
     lines = [f'row-{i:05d}: ordinary archive record.' for i in range(long_lines)]
     for pos, val in zip([0, long_lines//2, long_lines-1], ['amber-17','jade-42','violet-93']):
         lines[pos] = f'row-{pos:05d}: SECRET={val}'
@@ -105,7 +125,7 @@ def collect(url, key, payload, timeout):
              usage=None, text='', ttft_s=None, first_event_s=None, headers_s=None,
              total_s=None, stream_requested=bool(payload.get('stream')), stream_observed=False,
              done=False, finish_reasons=[], events=[], parse_errors=[], error=None,
-             logprobs_present=False, response_ids=[])
+             logprobs_present=False, logprobs=None, response_ids=[])
     raw = bytearray()
     def consume(obj, elapsed):
         if not isinstance(obj, dict):
@@ -131,6 +151,11 @@ def collect(url, key, payload, timeout):
                 r['finish_reasons'].append(choice['finish_reason'])
             if choice.get('logprobs') is not None:
                 r['logprobs_present'] = True
+                # The token slicing is the strongest tokenizer signal available.
+                # Keep the normalized description in the record; the full payload
+                # with its probabilities stays in the raw body file.
+                if r['logprobs'] is None:
+                    r['logprobs'] = fp.logprobs_notes(choice['logprobs'])
     try:
         req = urllib.request.Request(url, data=dumps(payload).encode(), headers={
             'Authorization': 'Bearer '+key, 'Content-Type': 'application/json',
@@ -213,22 +238,6 @@ def check(case, r):
     return None
 
 
-def redact(x, key):
-    if isinstance(x, str):
-        return x.replace(key, '[REDACTED]') if key else x
-    if isinstance(x, list):
-        return [redact(v, key) for v in x]
-    if isinstance(x, tuple):
-        return [redact(v, key) for v in x]
-    if isinstance(x, dict):
-        return {k: redact(v, key) for k,v in x.items()}
-    return x
-
-
-def md(x):
-    return str(x).replace('|', '\\|').replace('\n', ' ').replace('\r', ' ')
-
-
 def reports(out, rows, planned):
     fields = ['run_id','case_id','category','repeat','http_status','complete','model',
               'system_fingerprint','usage','ttft_s','total_s','validation_pass',
@@ -283,8 +292,159 @@ def reports(out, rows, planned):
         '- 总延迟包含连接与读取；流式读至 [DONE] 或 EOF。截断、拒答、length 结束请结合 finish_reasons 检查。',
         '- 固定答案采用精确字符检查，前后空白也会判为不通过。自动检查只覆盖固定答案与本工具的简单 schema；代码生成不执行，写作与改写需人工阅读。',
         '- 对照官方候选端点使用相同 corpus_sha256、参数、长度和重复数。缓存、系统提示、负载、版本与采样均会混淆结果。',
-        '- 更相似的输出只能支持行为相似；没有可信上游证据时不应据此宣布真实模型身份。', '']
+        '- 更相似的输出只能支持行为相似；没有可信上游证据时不应据此宣布真实模型身份。']
+    lines += signal_lines(rows)
+    lines.append('')
     (out/'report.md').write_text('\n'.join(lines), encoding='utf-8')
+
+
+def signal_lines(rows):
+    """Markdown for the side-channel signals that the rows already contain."""
+    data = fp.signals(rows)
+    agree = data['agreement']
+    lines = ['', '## 侧信道信号（来自已采集记录）', '',
+        '这些字段全部来自本次已保存的响应，不增加任何 API 调用。它们描述链路特征，不能单独判定模型身份。', '',
+        '| 信号 | 观察 |', '|---|---|']
+    for label in ('model', 'system_fingerprint', 'id_prefixes'):
+        point = agree.get(label) or {}
+        lines.append(f'| 响应字段 {md(label)} | 取值 {md(point.get("values") or "—")}；'
+                     f'{"本次运行内出现变化" if point.get("mixed") else "本次运行内一致"} |')
+    declared = agree.get('declared_model')
+    if declared:
+        lines.append(f'| 请求的模型 ID | {md(declared["values"])}；'
+                     + ('与响应返回的 model **不一致**' if declared['returned_differs']
+                        else '与响应返回的 model 一致') + ' |')
+    head = data['headers']
+    if head['collected']:
+        lines.append(f'| 响应头（{head["collected"]}/{head["total"]} 次记录） | '
+                     f'观测到 {md([n["name"] for n in head["notes"]])}；'
+                     f'未见 {md(head["absent"])}；'
+                     + (f'限流/追踪类：{md(head["present"])}' if head['present'] else '未见限流或追踪类头部') + ' |')
+    for item in data['tokenizer']:
+        lines.append(f'| 分词探针 {md(item["case_id"])} | 输入计数 {md(item.get("prompt_tokens"))}'
+                     + ('；' + md(item['note']) if item.get('note') else
+                        '；' + ('重复一致' if item.get('stable') else '重复间不一致，需核对')) + ' |')
+    for item in data['logprobs']:
+        lines.append(f'| logprobs 分词 {md(item["case_id"])} | 切分出 {md(item["token_counts"])} 个 token；'
+                     f'{item["distinct_tokenizations"]} 种切分；样例 {md(item["sample"])} |')
+    for stream in data['streams']:
+        if stream.get('gaps'):
+            lines.append(f'| 流式节奏 {md(stream["case_id"])} #{stream.get("repeat")} | '
+                         f'{stream["profile"]}；块间中位 {stream["gap_p50"]}s，抖动 {stream["gap_stdev"]}，'
+                         f'同批到达占比 {stream["simultaneous_ratio"]} |')
+    usage = data.get('usage_keys')
+    if usage:
+        lines.append(f'| usage 字段 | {md(usage["keys"])}；缓存类 {md(usage["cached"] or "无")}；'
+                     f'推理类 {md(usage["reasoning"] or "无")} |')
+    lines += ['', '- 响应 ID 前缀与 system_fingerprint 由服务端生成，可被代理转发或改写；相同前缀只说明链路相似。',
+        '- 流式节奏反映缓冲与排队：整段一起到达通常是缓冲，而不是模型生成速度。',
+        '- usage 中缓存/推理字段缺失，可能是上游未产生，也可能是适配层丢弃，需结合对照端点判断。', '']
+    return lines
+
+
+def model_urls(base):
+    """Candidate list endpoints, most likely first. A custom prefix is honoured first."""
+    text = base.strip().rstrip('/')
+    if text.lower().endswith('/chat/completions'):
+        text = text[:-len('/chat/completions')].rstrip('/')
+    urls = [text + '/models']
+    if text.endswith('/v1'):
+        # Some relays only expose the prefix-free path; others nest it twice.
+        urls.append(text[:-len('/v1')] + '/models')
+        urls.append(text + '/v1/models')
+    urls.append(text + '/api/tags')
+    if not text.endswith('/v1'):
+        urls.append(text + '/v1/models')
+    return list(dict.fromkeys(urls))
+
+
+def _model_id(item):
+    """Accept the OpenAI shape and the looser shapes relays and Ollama return."""
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        for field in ('id', 'name', 'model'):
+            if isinstance(item.get(field), str):
+                return item[field]
+    return None
+
+
+def parse_model_list(body):
+    """Extract ids plus the container shape that carried them.
+
+    A relay's list is self-reported metadata, exactly like the model field on a
+    chat response. It names what to test; it never identifies a backend.
+    """
+    try:
+        data = json.loads(body.decode('utf-8', errors='replace'))
+    except (ValueError, AttributeError):
+        return [], 'unparsed'
+    shape, items = None, None
+    if isinstance(data, list):
+        shape, items = 'array', data
+    elif isinstance(data, dict):
+        for key in ('data', 'models', 'model'):
+            if isinstance(data.get(key), list):
+                shape, items = 'object.' + key, data[key]
+                break
+    if items is None:
+        return [], shape or 'unknown'
+    seen, ids = set(), []
+    for item in items:
+        value = _model_id(item)
+        if value and value not in seen and len(value) <= 200:
+            seen.add(value)
+            ids.append(value)
+    return ids, shape
+
+
+def list_models(base, key, timeout):
+    """Probe candidate list endpoints and return every attempt, including failures.
+
+    Bodies are returned raw and unbounded: the caller decides what to persist.
+    """
+    attempts = []
+    for url in model_urls(base):
+        start = time.perf_counter()
+        status, headers, body, error = None, [], b'', None
+        try:
+            req = urllib.request.Request(url, headers={
+                'Authorization': 'Bearer '+key, 'Accept': 'application/json',
+                'Accept-Encoding': 'identity', 'User-Agent': 'behavior-fingerprint/'+VERSION})
+            try:
+                response = urllib.request.build_opener(NoRedirect()).open(req, timeout=timeout)
+            except urllib.error.HTTPError as e:
+                response = e
+            with response as resp:
+                status = resp.code
+                headers = list(resp.headers.items())
+                body = resp.read(4_000_000)
+        except Exception as e:
+            error = type(e).__name__+': '+str(e)
+        ids, shape = parse_model_list(body) if body else ([], 'empty')
+        attempts.append(dict(url=url, http_status=status, shape=shape, count=len(ids),
+                             models=ids, headers=list(fp.safe_headers(headers)),
+                             body=body.decode('utf-8', errors='replace'), error=error,
+                             elapsed_s=round(time.perf_counter()-start, 3)))
+        if ids:
+            break
+    return attempts
+
+
+def match_model(model, names):
+    """Compare the requested id against the advertised list, tolerating prefixes.
+
+    OpenRouter advertises vendor/model while callers often type the bare name, so
+    a vendor-qualified advertisement counts as present and is reported as loose.
+    unrelated_name must never match: only a proper path prefix does.
+    """
+    if not names:
+        return dict(matched=None, loose=False)
+    if model in names:
+        return dict(matched=True, loose=False)
+    loose = any(m.endswith('/'+model) or (model.endswith('/'+m) and m)
+                for m in names if isinstance(m, str))
+    return dict(matched=bool(loose), loose=bool(loose))
 
 
 def main():
@@ -357,10 +517,11 @@ def main():
             # Preserve response body bytes except exact API-key occurrences.
             (out/raw_name).write_bytes(raw.replace(key.encode(), b'[REDACTED]'))
             r.update(run_id=run_id, case_id=case['id'], category=case['category'], repeat=repeat,
-                     recorded_at=dt.datetime.now(dt.timezone.utc).isoformat(), request=payload,
-                     request_sha256=digest(dumps(payload)), raw_file=raw_name,
+                     declared_model=model, prompt_sha256=digest(case['prompt']),
+                     recorded_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+                     request=payload, request_sha256=digest(dumps(payload)), raw_file=raw_name,
                      validation_pass=check(case, r))
-            r['headers'] = [(k, '[REDACTED]' if any(s in k.lower() for s in ('cookie','authorization','api-key','api_key','token','secret')) else v) for k,v in r['headers']]
+            r['headers'] = fp.safe_headers(r['headers'])
             r = redact(r, key)
             with (out/'results.jsonl').open('a', encoding='utf-8') as f:
                 f.write(dumps(r)+'\n')
