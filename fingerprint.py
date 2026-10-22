@@ -382,19 +382,35 @@ def valid_reference(entry):
                and type(v.get('prompt_tokens')) is int for k, v in probes.items())
 
 
+def metadata_values(row, field):
+    values = set(v for v in row.get(field+'_values', []) if isinstance(v, str))
+    if isinstance(row.get(field), str):
+        values.add(row[field])
+    # Older saved runs retained SSE events but only normalized the final value.
+    for event in row.get('events') or []:
+        try:
+            obj = json.loads(event['data'])
+            if isinstance(obj, dict) and isinstance(obj.get(field), str):
+                values.add(obj[field])
+        except (ValueError, TypeError, KeyError):
+            pass
+    return sorted(values)
+
+
 def agreement(rows):
     """How tightly metadata repeats, including identity changes mid-run.
 
     Repeated identical requests may legitimately differ, so a disagreement is a
     lead to verify, never a verdict.
     """
-    models = [r['model'] for r in rows if isinstance(r.get('model'), str)]
-    prints = [r['system_fingerprint'] for r in rows if isinstance(r.get('system_fingerprint'), str)]
+    models = [v for r in rows for v in metadata_values(r, 'model')]
+    prints = [v for r in rows for v in metadata_values(r, 'system_fingerprint')]
     out = {}
     for label, values in (('model', models), ('system_fingerprint', prints)):
         counter = collections.Counter(values)
         out[label] = dict(distinct=len(counter), values=[v for v, _ in counter.most_common(8)],
-                          mixed=len(counter) > 1)
+                          mixed=len(counter) > 1,
+                          within_response_changes=sum(len(metadata_values(r, label)) > 1 for r in rows))
     prefixes = collections.Counter(d['prefix'] for d in id_summary(
         [i for r in rows for i in (r.get('response_ids') or [])]))
     out['id_prefixes'] = dict(distinct=len(prefixes),
@@ -405,7 +421,7 @@ def agreement(rows):
         differs = bool(models) and set(models) != set(declared)
         out['declared_model'] = dict(distinct=len(declared), values=declared, mixed=False,
                                      returned_differs=differs,
-                                     note=('请求的模型 ID 与响应返回的 model 不一致，这是最强的一类线索。'
+                                      note=('请求的模型 ID 与响应返回的 model 不一致；可能是别名或代理改写，不能证明模型身份。'
                                            if differs else '本次运行中两者一致。'))
     return out
 
@@ -414,19 +430,30 @@ def logprobs_signals(rows):
     """Tokenizer slicing exposed by real logprobs payloads."""
     out = []
     for name, group in sorted(group_rows(rows).items()):
-        if name != 'logprobs':
+        if name not in ('logprobs', 'top_logprobs'):
             continue
-        notes = [r['logprobs'] for r in group if isinstance(r.get('logprobs'), dict)]
-        if not notes:
-            continue
-        firsts = collections.Counter(tuple(n.get('first_tokens') or []) for n in notes)
-        sample = next(iter(firsts), ())
-        out.append(dict(case_id=name, probes=len(notes),
-                        token_counts=sorted({n['tokens'] for n in notes}),
-                        distinct_tokenizations=len(firsts), stable=len(firsts) == 1,
-                        sample=list(sample)[:12],
-                        note='logprobs 的 token 切分直接反映服务端分词器；同一文本多次切分不一致说明上游不止一个。'))
+        by_text = collections.defaultdict(list)
+        for r in group:
+            if r.get('complete') and isinstance(r.get('logprobs'), dict) and isinstance(r.get('text'), str):
+                by_text[digest(r['text'])].append(r['logprobs'])
+        for text_hash, notes in by_text.items():
+            firsts = collections.Counter(tuple(n.get('first_tokens') or []) for n in notes)
+            sample = next(iter(firsts), ())
+            out.append(dict(case_id=name, output_sha256=text_hash, probes=len(notes),
+                            token_counts=sorted({n['tokens'] for n in notes}),
+                            distinct_tokenizations=len(firsts), stable=len(firsts) == 1 if len(notes) > 1 else None,
+                            sample=list(sample)[:12],
+                            note='仅比较相同输出文本的已保存切分样例；差异是待核实线索，不证明上游数量或模型身份。'
+                                 if len(notes) > 1 else '相同输出文本只有一次记录，无法评价重复切分稳定性。'))
     return out
+
+
+def usage_paths(value, prefix=''):
+    for key, child in value.items():
+        path = prefix + str(key)
+        yield path
+        if isinstance(child, dict):
+            yield from usage_paths(child, path+'.')
 
 
 def signals(rows):
@@ -446,7 +473,7 @@ def signals(rows):
         generated_at=dt.datetime.now(dt.timezone.utc).isoformat(),
     )
     if usages:
-        keys = sorted({k for u in usages for k in u})
+        keys = sorted({k for u in usages for k in usage_paths(u)})
         out['usage_keys'] = dict(
             keys=keys,
             cached=[k for k in keys if 'cache' in k],
@@ -459,6 +486,12 @@ def summarize(rows):
     """Per-run aggregates for both the UI and the exported report."""
     groups = group_rows(rows)
     anomalies = []
+    for r in rows:
+        for field in ('model', 'system_fingerprint'):
+            values = metadata_values(r, field)
+            if len(values) > 1:
+                anomalies.append(dict(case_id=r.get('case_id'), kind='metadata',
+                                      message=f'单次响应内 {field} 出现变化：{values}。请核对原始事件，不据此判断模型身份。'))
     for name, group in groups.items():
         good = [r for r in group if r.get('complete')]
         prompt = _prompt_tokens(good)

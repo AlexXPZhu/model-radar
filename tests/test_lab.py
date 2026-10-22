@@ -340,7 +340,7 @@ class ReferenceRunTests(LabHarness,unittest.TestCase):
         swapped=self.server.lab.load(self.run_models(self.provider.replace('/v1','/alt/v1')))
         self.assertEqual(swapped['tokref']['declared']['level'],'different')
         self.assertIn('分词参照比对',swapped['report'])
-        self.assertIn('分词不一致',swapped['report'])
+        self.assertIn('探针计数差分不一致',swapped['report'])
         # A duplicate is refused; deletion empties the local library.
         with self.assertRaises(urllib.error.HTTPError) as caught:
             self.request('/api/reference',{'run_id':ref_run,'label':'again'})
@@ -359,7 +359,7 @@ class ReferenceRunTests(LabHarness,unittest.TestCase):
         # The detail verdict and the report must not disagree, and the section
         # must be replaced rather than appended.
         self.assertEqual(after['tokref']['declared']['level'],'different')
-        self.assertIn('分词不一致',after['report'])
+        self.assertIn('探针计数差分不一致',after['report'])
         self.assertNotIn('参照库中没有可比的参照',after['report'])
         self.assertEqual(after['report'].count('## 分词参照比对'),1)
         # The stored evidence on disk keeps what was collected at run time.
@@ -374,7 +374,7 @@ class ReferenceRunTests(LabHarness,unittest.TestCase):
         gone=self.server.lab.load(relay)
         self.assertIn('参照库中没有可比的参照',gone['report'])
         self.assertEqual(gone['report'].count('## 分词参照比对'),1)
-        self.assertNotIn('分词不一致',gone['report'])
+        self.assertNotIn('探针计数差分不一致',gone['report'])
         after_delete=self.server.lab.load(during)
         self.assertIn('检测时为：1 条本地参照',after_delete['report'])
     def test_report_refresh_is_stable_and_spares_other_sections(self):

@@ -34,7 +34,7 @@ PRESETS = {
 BUILTIN_REFERENCES = ROOT/'reference'/'tokenizers.json'
 
 
-LEVEL_NAMES = {'exact': '逐 token 一致', 'near': '接近，非逐 token 一致', 'different': '不一致',
+LEVEL_NAMES = {'exact': '探针计数差分完全一致', 'near': '计数差分接近，非完全一致', 'different': '不一致',
                'unstable': '计量不稳定，不下结论'}
 
 
@@ -42,7 +42,7 @@ def tokref_lines(result):
     """Markdown for the reference comparison; empty when the run has no probes."""
     if not result['usable']:
         return ''
-    lines = ['', '## 分词参照比对', '']
+    lines = ['', '## 分词参照比对', '', f'分析版本：{core.VERSION}。本节只比较探针计数差分。']
     if result.get('snapshot'):
         lines.append(f'本节的参照库快照：{result["snapshot"]}')
     if not result['matches']:
@@ -51,8 +51,7 @@ def tokref_lines(result):
     else:
         lines += ['| 参照 | 系列 | 结论 | 最大差值 | 平均相对误差 | 输入偏移 |', '|---|---|---|---:|---:|---:|']
         for m in result['matches']:
-            level = LEVEL_NAMES[m['level']] + (f'（按众数为 {LEVEL_NAMES[m["provisional"]]}）'
-                                               if m['level'] == 'unstable' else '')
+            level = LEVEL_NAMES[m['level']]
             offset = m['offset'] if m['level'] == 'exact' and m['anchored_on_base'] else '—'
             lines.append(f'| {core.md(m["label"])} | {core.md(m["family"] or "—")} | {level} | '
                          f'{m["max_abs_diff"]} | {m["mean_rel_err"]} | {offset} |')
@@ -67,7 +66,7 @@ def tokref_lines(result):
             lines.append('- 请提高重复次数后重测；混合路由本身就是一个需要核实的线索。')
         elif declared['level'] == 'different':
             nearest = declared.get('nearest')
-            lines.append(f'- **请求的模型 {core.md(declared["model"])} 与它自己的参照“{core.md(declared["label"])}”分词不一致。**'
+            lines.append(f'- **请求的模型 {core.md(declared["model"])} 与它自己的参照“{core.md(declared["label"])}”探针计数差分不一致。**'
                          + (f'最接近的是“{core.md(nearest["label"])}”（{LEVEL_NAMES[nearest["level"]]}）。' if nearest else ''))
             lines.append('- 也可能是中转站自己估算 usage（例如用 tiktoken 本地计数）而非透传上游计量；请对照原始响应核实。')
         else:
@@ -75,7 +74,7 @@ def tokref_lines(result):
                          f'{LEVEL_NAMES[declared["level"]]}。')
             if declared.get('offset'):
                 lines.append(f'- 空载探针比参照多计 {declared["offset"]} 个输入 token：每次请求可能附带了隐藏上下文，或计费口径不同。')
-    lines += ['- 差分比较抵消了聊天模板和固定的隐藏系统提示。分词器相同只说明同一系列，'
+    lines += ['- 差分比较仅在固定开销与计量口径一致时抵消固定上下文。计数相同不证明切分或模型相同，'
               '例如 gpt-4o 与 gpt-4o-mini 共用分词器，不能区分同系列的大小模型。', '']
     return '\n'.join(lines)
 
@@ -143,7 +142,7 @@ def validate_config(data):
     config = dict(endpoint=url, model=model, cases=cases,
                   label=str(data.get('label', '')).strip()[:100] or model,
                   repeats=finite_number(data.get('repeats', 3), 1, 20, '重复次数', True),
-                  timeout=finite_number(data.get('timeout', 90), 1, 600, '读取超时'),
+                  timeout=finite_number(data.get('timeout', 90), 1, 600, '请求时限'),
                   interval=finite_number(data.get('interval', .5), 0, 60, '请求间隔'),
                   long_lines=lines, shuffle_seed=20260929, version=core.VERSION)
     config['corpus_sha256'] = core.digest(core.dumps(cases))
@@ -252,25 +251,34 @@ class Lab:
                                                           for e in entries])), encoding='utf-8')
         tmp.replace(self.reference_file)
 
-    def library_snapshot(self, recorded=None):
+    def reference_bundle(self):
+        entries = sorted(self.references(), key=core.dumps)
+        return dict(schema=1, algorithm_version=core.VERSION,
+                    reference_set_sha256=core.digest(core.dumps(entries)), entries=entries,
+                    fallback_probe_hashes=probe_hashes())
+
+    def library_snapshot(self, recorded=None, entries=None):
         """Short label for the reference library a verdict was computed against.
 
         A comparison means nothing without knowing which library produced it, so
         every report and the UI both carry this label.
         """
-        local = [r for r in self.references() if r.get('source') == 'local']
+        entries = self.reference_bundle()['entries'] if entries is None else entries
+        local = [r for r in entries if r.get('source') == 'local']
         count = len(local)
         state = f'{count} 条本地参照' if count else '本地参照库为空'
+        state += f'；共 {len(entries)} 条；SHA-256 {core.digest(core.dumps(entries))}'
         if recorded and recorded != state:
             return f'{state}（检测时为：{recorded}）'
         return state
 
-    def tokref_lines(self, rows, snapshot=None):
-        result = fp.tokenizer_matches(rows, self.references(), probe_hashes())
-        result['snapshot'] = snapshot or self.library_snapshot()
+    def tokref_lines(self, rows, snapshot=None, entries=None):
+        entries = self.reference_bundle()['entries'] if entries is None else entries
+        result = fp.tokenizer_matches(rows, entries, probe_hashes())
+        result['snapshot'] = snapshot or self.library_snapshot(entries=entries)
         return tokref_lines(result)
 
-    def refresh_report(self, report, rows, manifest, run_id=None):
+    def refresh_report(self, report, rows, manifest, run_id=None, entries=None):
         """Rebuild the referenced sections from the current library.
 
         The stored report is the record of what was collected; the sections that
@@ -288,7 +296,7 @@ class Lab:
         out, dropping = [], False
         for line in lines:
             if line in REGENERATED_SECTIONS:
-                fresh = self.regenerated_section(line, rows, manifest)
+                fresh = self.regenerated_section(line, rows, manifest, entries)
                 if fresh:
                     out.append(fresh)
                 dropping = True
@@ -300,11 +308,11 @@ class Lab:
             out.append(line)
         return '\n'.join(out)
 
-    def regenerated_section(self, heading, rows, manifest):
+    def regenerated_section(self, heading, rows, manifest, entries=None):
         if heading == '## 分词参照比对':
             # Carries the library size recorded at run time, so a verdict read
             # after the library changed still says what it was compared against.
-            return self.tokref_lines(rows, self.library_snapshot(manifest.get('tokref_snapshot')))
+            return self.tokref_lines(rows, self.library_snapshot(manifest.get('tokref_snapshot'), entries), entries)
         if heading == '## 模型列表核对' and manifest.get('models_ref'):
             return models_ref_lines(manifest['models_ref'])
         return ''
@@ -325,6 +333,11 @@ class Lab:
             config.update(run_id=run_id, created_at=dt.datetime.now(dt.timezone.utc).isoformat(), status='running')
             out = self.data_dir/run_id
             (out/'raw').mkdir(parents=True)
+            bundle = self.reference_bundle()
+            config['reference_set_sha256'] = bundle['reference_set_sha256']
+            config['analysis_version'] = core.VERSION
+            config['tokref_snapshot'] = self.library_snapshot(entries=bundle['entries'])
+            (out/'references-collected.json').write_text(core.dumps(bundle), encoding='utf-8')
             self.attach_discovery(out, config.get('models_ref'))
             self.write_manifest(out, core.redact(config, key))
             self.cancel.clear()
@@ -344,8 +357,9 @@ class Lab:
         base_url = str(data.get('base_url', '')).strip()
         if not base_url:
             raise ValueError('请填写 Base URL')
+        core.endpoint(base_url)
         key = core.validate_key(str(data.get('api_key', '')), 'discovery')
-        timeout = finite_number(data.get('timeout', 15), 1, 600, '读取超时')
+        timeout = finite_number(data.get('timeout', 15), 1, 600, '请求时限')
         attempts = core.list_models(base_url, key, timeout)
         kept = next((a['models'] for a in attempts if a['models']), [])
         # Keep the ids as returned; truncate only to bound the stored payload.
@@ -405,7 +419,7 @@ class Lab:
         with self.lock:
             if self.state['status'] == 'running':
                 self.cancel.set()
-                self.state.update(status='stopping', message='等待当前请求结束；之后不再发起请求')
+                self.state.update(status='stopping', message='正在中止请求并保存已收到的证据')
         return self.snapshot()
 
     def snapshot(self):
@@ -426,7 +440,7 @@ class Lab:
                 with self.lock:
                     self.state['current'] = {'case_id':case['id'], 'repeat':repeat, 'started_at':time.time()}
                 payload = dict(model=config['model'], messages=[{'role':'user','content':case['prompt']}], **case['params'])
-                row, raw = core.collect(config['endpoint'], key, payload, config['timeout'])
+                row, raw = core.collect(config['endpoint'], key, payload, config['timeout'], cancel=self.cancel)
                 raw_file = f'raw/{n:04d}_{case["id"]}_{repeat}.body'
                 (out/raw_file).write_bytes(raw.replace(key.encode(), b'[REDACTED]'))
                 row.update(run_id=config['run_id'],case_id=case['id'],category=case['category'],repeat=repeat,
@@ -477,9 +491,9 @@ class Lab:
                             f.write('- 命中方式是去前缀匹配，列表用的是供应商限定名。\n')
                         f.write('- 列表由端点自报，可被改写。它只用于生成待测假设，不能证明底层模型身份。\n')
                 config.update(status=status,message=message,completed_requests=len(rows))
-                config['tokref_snapshot'] = self.library_snapshot()
+                collected = json.loads((out/'references-collected.json').read_text(encoding='utf-8'))
                 with (out/'report.md').open('a',encoding='utf-8') as f:
-                    f.write(self.tokref_lines(rows))
+                    f.write(self.tokref_lines(rows, config['tokref_snapshot'], collected['entries']))
                 self.write_manifest(out,core.redact(config,key))
             finally:
                 key = ''
@@ -506,7 +520,8 @@ class Lab:
             if not full:
                 return dict(manifest=manifest,rows=rows,summary=summarize(rows))
             report = (out/'report.md').read_text(encoding='utf-8') if (out/'report.md').exists() else ''
-            refreshed = self.refresh_report(report, rows, manifest)
+            analysis_references = self.reference_bundle()
+            refreshed = self.refresh_report(report, rows, manifest, entries=analysis_references['entries'])
             if refreshed is not None:
                 report = refreshed
             models = None
@@ -523,8 +538,9 @@ class Lab:
             # applies to older runs too.
             return dict(manifest=manifest,rows=rows,summary=summarize(rows),report=report,
                         signals=fp.signals(rows),models=models,
-                        tokref=fp.tokenizer_matches(rows,self.references(),probe_hashes()),
-                        tokref_snapshot=self.library_snapshot(manifest.get('tokref_snapshot')))
+                        tokref=fp.tokenizer_matches(rows,analysis_references['entries'],probe_hashes()),
+                        analysis_references=analysis_references,
+                        tokref_snapshot=self.library_snapshot(manifest.get('tokref_snapshot'), analysis_references['entries']))
 
     def history(self):
         history = []
@@ -683,9 +699,11 @@ class Handler(BaseHTTPRequestHandler):
                 report = item['report'].encode('utf-8')
                 buf = io.BytesIO()
                 with zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED) as archive:
+                    archive.writestr('references-analysis.json', core.dumps(item['analysis_references']))
                     for f in out.rglob('*'):
                         if f.is_file() and not f.is_symlink() and f.suffix != '.tmp':
                             if f.name == 'report.md':
+                                archive.write(f, 'report-collected.md')
                                 archive.writestr('report.md', report)
                             else:
                                 archive.write(f, f.relative_to(out))

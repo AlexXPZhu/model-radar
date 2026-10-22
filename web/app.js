@@ -71,6 +71,7 @@ function signalPanel(){
     const point=sig.agreement?.[id];if(!point)continue;
     cards.push([`${label}：${list(point.values)}`,
       (point.mixed?'本次运行内出现过变化。':'本次运行内保持一致。')+
+      (point.within_response_changes?`其中 ${point.within_response_changes} 次响应内部出现变化，请核对原始事件。`:'')+
       (id==='id_prefixes'?'ID 前缀由服务端生成，可被代理转发或改写；相同前缀只说明链路相似。':''),false]);
   }
   const dm=sig.agreement?.declared_model;
@@ -101,23 +102,25 @@ ${l.note||''}`,l.distinct_tokenizations>1]);
 }
 // Differential tokenizer comparison against the reference library. A shared
 // tokenizer names a family, never a model size, so no probability is shown.
-const levelNames={exact:'逐 token 一致',near:'接近，非逐 token 一致',different:'不一致'};
+const levelNames={exact:'探针计数差分完全一致',near:'计数差分接近，非完全一致',different:'不一致',unstable:'计量不稳定，不下结论'};
 function tokrefBlock(){
   const t=detail?.tokref;
   if(!t||!t.usable)return '';
   if(!t.matches.length)return `<div class="signal"><strong>分词参照比对</strong><p>${esc(t.references?
-    '参照库里没有与本次探针文本相同的参照。':'参照库为空。')}请先用“分词与计量”方案检测一个可信的官方端点，再在那条记录上点“设为分词参照”。</p></div>`;
+    '参照库里没有与本次探针文本相同的参照。':'参照库为空。')}请先用“分词与计量”方案检测一个可信的官方端点，再在那条记录上点“设为分词参照”。</p><p>${esc(detail.tokref_snapshot||'')}</p></div>`;
   const d=t.declared;
-  let verdict='本次请求的模型没有对应的参照，下表只列出最接近的分词器。';
-  if(d&&d.level==='different')verdict=`请求的模型 ${d.model} 与它自己的参照“${d.label}”分词不一致。`+
+  const snapshot=detail.tokref_snapshot||'';
+  let verdict='本次请求的模型没有对应的参照，下表只列出计数差分最接近的参照。';
+  if(d&&d.level==='different')verdict=`请求的模型 ${d.model} 与它自己的参照“${d.label}”探针计数差分不一致。`+
     (d.nearest?`最接近的是“${d.nearest.label}”（${levelNames[d.nearest.level]}）。`:'')+
     '\n也可能是中转站用本地估算代替了上游计量，请对照原始响应核实。';
+  else if(d?.level==='unstable')verdict='计量不稳定，不下结论。请核对计量口径并重测；不按众数判断模型身份。';
   else if(d)verdict=`请求的模型 ${d.model} 与它的参照“${d.label}”${levelNames[d.level]}。`+
     (d.offset?`\n空载探针比参照多计 ${d.offset} 个输入 token：可能附带了隐藏上下文，或计费口径不同。`:'');
   const rows=t.matches.map(m=>`<tr><td>${esc(m.label)}${m.source==='builtin'?' · 内置':''}</td><td>${esc(m.family||'—')}</td><td>${esc(levelNames[m.level])}</td><td>${m.max_abs_diff}</td><td>${m.level==='exact'&&m.anchored_on_base?m.offset:'—'}</td></tr>`).join('');
-  return `<div class="signal${d?.level==='different'?' lead':''}"><strong>分词参照比对</strong><p>${esc(verdict).replace(/\n/g,'<br>')}</p>`+
+  return `<div class="signal${d?.level==='different'?' lead':''}"><strong>分词参照比对</strong><p>${esc(verdict).replace(/\n/g,'<br>')}</p><p>${esc(snapshot)}</p>`+
     `<div class="table-wrap"><table><thead><tr><th>参照</th><th>系列</th><th>结论</th><th>最大差值</th><th>输入偏移</th></tr></thead><tbody>${rows}</tbody></table></div>`+
-    `<p>差分比较抵消了聊天模板和固定的隐藏系统提示。分词器相同只说明同一系列，例如 gpt-4o 与 gpt-4o-mini 共用分词器。</p></div>`;
+    `<p>差分比较仅在固定开销与计量口径一致时抵消固定上下文。计数相同不证明切分或模型相同，例如 gpt-4o 与 gpt-4o-mini 共用分词器。</p></div>`;
 }
 async function refreshReferences(){
   const refs=await api('/api/references');

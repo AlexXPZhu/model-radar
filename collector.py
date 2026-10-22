@@ -18,8 +18,9 @@ import urllib.request
 import uuid
 
 import fingerprint as fp
+from transport import RequestBudget, RequestStopped, read_chunks
 
-VERSION = '2.1.0'
+VERSION = '2.2.0'
 SCHEMA = {'type': 'json_schema', 'json_schema': {'name': 'probe', 'strict': True,
     'schema': {'type': 'object', 'properties': {'x': {'type': 'integer'}},
                'required': ['x'], 'additionalProperties': False}}}
@@ -119,14 +120,16 @@ def endpoint(base):
     return base.rstrip('/') if u.path.rstrip('/').endswith('/chat/completions') else base.rstrip('/')+'/chat/completions'
 
 
-def collect(url, key, payload, timeout):
+def collect(url, key, payload, timeout, cancel=None, max_bytes=8_000_000, max_events=10_000):
     start = time.perf_counter()
     r = dict(http_status=None, headers=[], model=None, system_fingerprint=None,
              usage=None, text='', ttft_s=None, first_event_s=None, headers_s=None,
              total_s=None, stream_requested=bool(payload.get('stream')), stream_observed=False,
              done=False, finish_reasons=[], events=[], parse_errors=[], error=None,
-             logprobs_present=False, logprobs=None, response_ids=[])
+             logprobs_present=False, logprobs=None, response_ids=[],
+             model_values=[], system_fingerprint_values=[], termination_reason=None)
     raw = bytearray()
+    budget = RequestBudget(timeout, cancel)
     def consume(obj, elapsed):
         if not isinstance(obj, dict):
             r['parse_errors'].append('JSON response/event is not an object')
@@ -138,6 +141,8 @@ def collect(url, key, payload, timeout):
         for field in ('model', 'system_fingerprint', 'usage'):
             if obj.get(field) is not None:
                 r[field] = obj[field]
+                if field != 'usage' and isinstance(obj[field], str) and obj[field] not in r[field+'_values']:
+                    r[field+'_values'].append(obj[field])
         for choice in obj.get('choices') or []:
             if choice.get('index', 0) != 0:
                 continue
@@ -157,71 +162,87 @@ def collect(url, key, payload, timeout):
                 if r['logprobs'] is None:
                     r['logprobs'] = fp.logprobs_notes(choice['logprobs'])
     try:
+        endpoint(url)  # Validate before constructing any authenticated request.
         req = urllib.request.Request(url, data=dumps(payload).encode(), headers={
             'Authorization': 'Bearer '+key, 'Content-Type': 'application/json',
             'Accept': 'text/event-stream' if payload.get('stream') else 'application/json',
             'Accept-Encoding': 'identity', 'User-Agent': 'behavior-fingerprint/'+VERSION})
-        try:
-            response = urllib.request.build_opener(NoRedirect()).open(req, timeout=timeout)
-        except urllib.error.HTTPError as e:
-            response = e
-        with response as resp:
-            r['headers_s'] = time.perf_counter()-start
-            r['http_status'] = resp.code
-            r['headers'] = list(resp.headers.items())
-            r['stream_observed'] = 'text/event-stream' in resp.headers.get('Content-Type', '').lower()
-            if r['stream_observed']:
-                data = []
-                def dispatch():
-                    if not data:
-                        return
-                    s = '\n'.join(data)
-                    data.clear()
-                    elapsed = time.perf_counter()-start
-                    if r['first_event_s'] is None:
-                        r['first_event_s'] = elapsed
-                    r['events'].append({'elapsed_s': elapsed, 'data': s})
-                    if s.strip() == '[DONE]':
-                        r['done'] = True
-                        return
-                    try:
-                        consume(json.loads(s), elapsed)
-                    except (ValueError, TypeError, AttributeError) as e:
-                        r['parse_errors'].append(str(e))
-                while True:
-                    line = resp.readline()
-                    if not line:
-                        dispatch()
-                        break
-                    raw.extend(line)
-                    s = line.decode('utf-8', errors='replace').rstrip('\r\n')
-                    if not s:
-                        dispatch()
-                        if r['done']:
-                            break
-                    elif s.startswith('data:'):
-                        data.append(s[5:].removeprefix(' '))
-            else:
-                while True:
-                    block = resp.read(65536)
-                    if not block:
-                        break
-                    raw.extend(block)
-                try:
-                    consume(json.loads(raw), time.perf_counter()-start)
-                except (ValueError, TypeError, AttributeError) as e:
-                    r['parse_errors'].append(str(e))
+        with budget:
+            try:
+                response = budget.opener().open(req, timeout=timeout)
+            except urllib.error.HTTPError as e:
+                response = e
+            with response as resp:
+                _read_response(resp, budget, raw, max_bytes, max_events, r, consume, start)
+                budget.check()
     except KeyboardInterrupt:
         r['error'] = 'Interrupted by user'
         r['interrupted'] = True
+        r['termination_reason'] = 'cancelled'
     except Exception as e:
-        r['error'] = type(e).__name__+': '+str(e)
+        try:
+            budget.check()
+        except RequestStopped:
+            pass
+        r['termination_reason'] = budget.reason or (str(e) if isinstance(e, RequestStopped) else None)
+        r['error'] = r['termination_reason'] or type(e).__name__+': '+str(e)
     r['total_s'] = time.perf_counter()-start
     r['http_ok'] = r['http_status'] is not None and 200 <= r['http_status'] < 300
     r['complete'] = (r['http_ok'] and not r['error'] and not r['parse_errors']
                      and bool(r['finish_reasons']) and (not r['stream_observed'] or r['done']))
     r['output_sha256'] = digest(r['text'])
     return r, bytes(raw)
+
+
+def _read_response(resp, budget, raw, max_bytes, max_events, r, consume, start):
+    r['headers_s'] = time.perf_counter()-start
+    r['http_status'] = resp.code
+    r['headers'] = list(resp.headers.items())
+    r['stream_observed'] = 'text/event-stream' in resp.headers.get('Content-Type', '').lower()
+    if r['stream_observed']:
+        data = []
+        def dispatch():
+            if not data:
+                return
+            s = '\n'.join(data)
+            data.clear()
+            elapsed = time.perf_counter()-start
+            if r['first_event_s'] is None:
+                r['first_event_s'] = elapsed
+            if len(r['events']) >= max_events:
+                raise RequestStopped('event_count_limit')
+            r['events'].append({'elapsed_s': elapsed, 'data': s})
+            if s.strip() == '[DONE]':
+                r['done'] = True
+                return
+            try:
+                consume(json.loads(s), elapsed)
+            except (ValueError, TypeError, AttributeError) as e:
+                r['parse_errors'].append(str(e))
+        pending = bytearray()
+        for block in read_chunks(resp, budget, raw, max_bytes):
+            pending.extend(block)
+            while b'\n' in pending:
+                line, _, rest = pending.partition(b'\n')
+                pending = bytearray(rest)
+                s = line.decode('utf-8', errors='replace').rstrip('\r')
+                if not s:
+                    dispatch()
+                    if r['done']:
+                        return
+                elif s.startswith('data:'):
+                    data.append(s[5:].removeprefix(' '))
+            budget.check()
+        if pending.startswith(b'data:'):
+            data.append(pending[5:].decode('utf-8', errors='replace').removeprefix(' '))
+        dispatch()
+    else:
+        for block in read_chunks(resp, budget, raw, max_bytes):
+            pass
+        try:
+            consume(json.loads(raw), time.perf_counter()-start)
+        except (ValueError, TypeError, AttributeError) as e:
+            r['parse_errors'].append(str(e))
 
 
 def check(case, r):
@@ -401,8 +422,9 @@ def parse_model_list(body):
 def list_models(base, key, timeout):
     """Probe candidate list endpoints and return every attempt, including failures.
 
-    Bodies are returned raw and unbounded: the caller decides what to persist.
+    Bodies are bounded to 4 MB per route; each route has a total deadline.
     """
+    endpoint(base)  # Reject unsafe URLs before sending the key on any route.
     attempts = []
     for url in model_urls(base):
         start = time.perf_counter()
@@ -411,14 +433,20 @@ def list_models(base, key, timeout):
             req = urllib.request.Request(url, headers={
                 'Authorization': 'Bearer '+key, 'Accept': 'application/json',
                 'Accept-Encoding': 'identity', 'User-Agent': 'behavior-fingerprint/'+VERSION})
-            try:
-                response = urllib.request.build_opener(NoRedirect()).open(req, timeout=timeout)
-            except urllib.error.HTTPError as e:
-                response = e
-            with response as resp:
-                status = resp.code
-                headers = list(resp.headers.items())
-                body = resp.read(4_000_000)
+            raw = bytearray()
+            with RequestBudget(timeout) as budget:
+                try:
+                    response = budget.opener().open(req, timeout=timeout)
+                except urllib.error.HTTPError as e:
+                    response = e
+                with response as resp:
+                    status = resp.code
+                    headers = list(resp.headers.items())
+                    try:
+                        for block in read_chunks(resp, budget, raw, 4_000_000):
+                            pass
+                    finally:
+                        body = bytes(raw)
         except Exception as e:
             error = type(e).__name__+': '+str(e)
         ids, shape = parse_model_list(body) if body else ([], 'empty')
@@ -455,7 +483,7 @@ def main():
     p.add_argument('--model', default=os.getenv('OPENAI_MODEL'))
     p.add_argument('--repeats', type=int, default=3)
     p.add_argument('--long-lines', type=int, default=800)
-    p.add_argument('--timeout', type=float, default=90, help='Socket operation timeout, not a total deadline')
+    p.add_argument('--timeout', type=float, default=90, help='Total request deadline in seconds (OS DNS resolution may delay return)')
     p.add_argument('--interval', type=float, default=0.5)
     p.add_argument('--out', default='fingerprint_runs')
     p.add_argument('--only', help='Comma-separated case IDs')
